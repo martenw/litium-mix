@@ -15,6 +15,7 @@ var username = "apiuser";
 var password = "apiuser";
 var host = "https://demo.localtest.me:5001";
 var orderId = "LS75757";
+var sroId = ""; // optional: set to an existing SRO ID to test SRO actions directly
 // ============================================================
 
 var token = "";
@@ -26,7 +27,6 @@ var client = new HttpClient(handler);
 JsonNode? order = null;
 var shipmentId = "";
 var rmaSystemId = ""; // active RMA UUID
-var sroId = "";       // active SRO ID
 var rmaList = new List<JsonNode>();  // all RMAs for current order
 var sroList = new List<string>();    // all SRO IDs for current order
 
@@ -414,6 +414,11 @@ async Task RMAActionMenu()
 
 async Task SROMenu()
 {
+    if (!string.IsNullOrEmpty(sroId))
+    {
+        await SROActionMenu();
+        return;
+    }
     while (true)
     {
         await GetState();
@@ -464,16 +469,23 @@ async Task SROActionMenu()
             "=== SRO Actions ===",
             $"  SRO: {sroOrder?["id"]}  |  {sroOrder?["grandTotal"]} {sroOrder?["currencyCode"]}",
             "",
+            "  p.  Print SRO JSON",
             "  1.  Confirm return",
             "  2.  Refund",
+            "  3.  Add refund fee",
             "  0.  Back"
         ]);
         try
         {
             switch (Console.ReadLine()?.Trim())
             {
+                case "p":
+                case "P":
+                    Console.WriteLine(sroOrder?.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+                    break;
                 case "1": await SroAction("confirmReturn"); break;
                 case "2": await SroAction("refund"); break;
+                case "3": await AddRefundFee(sroOrder!); break;
                 case "0": return;
                 default: Console.WriteLine("Invalid choice."); break;
             }
@@ -481,6 +493,79 @@ async Task SROActionMenu()
         catch (HttpRequestException ex) { Console.WriteLine($"[HTTP ERROR] {ex.Message}"); }
         catch (Exception ex) { Console.WriteLine($"[ERROR] {ex.Message}"); }
     }
+}
+
+async Task AddRefundFee(JsonNode sroOrder)
+{
+    Console.Write("  Fee amount (incl. VAT): ");
+    if (!decimal.TryParse(Console.ReadLine()?.Trim(), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var fee) || fee <= 0)
+    {
+        Console.WriteLine("Invalid amount.");
+        return;
+    }
+
+    // Collect product rows and group by VAT rate for pro-rata distribution
+    var productRows = sroOrder["rows"]?.AsArray()
+        .Where(r => r?["type"]?.GetValue<string>() == "product")
+        .ToList() ?? [];
+
+    var totalAbsIncl = productRows.Sum(r => Math.Abs(r?["totalIncludingVat"]?.GetValue<decimal>() ?? 0));
+    if (totalAbsIncl == 0)
+        throw new InvalidOperationException("No product rows with amounts in SRO.");
+
+    var vatGroups = productRows
+        .GroupBy(r => r?["vatRate"]?.GetValue<decimal>() ?? 0m)
+        .Select(g => (VatRate: g.Key, AbsTotal: g.Sum(r => Math.Abs(r?["totalIncludingVat"]?.GetValue<decimal>() ?? 0))))
+        .ToList();
+
+    // Build one fee row per VAT rate; last group absorbs rounding remainder
+    var feeRows = new List<object>();
+    var allocated = 0m;
+    for (int i = 0; i < vatGroups.Count; i++)
+    {
+        var g = vatGroups[i];
+        var portionIncl = i < vatGroups.Count - 1
+            ? Math.Round(fee * g.AbsTotal / totalAbsIncl, 2)
+            : fee - allocated;
+        var vatAmount = Math.Round(portionIncl * g.VatRate / (1 + g.VatRate), 2);
+        var portionExcl = portionIncl - vatAmount;
+        allocated += portionIncl;
+        var pct = Math.Round(g.VatRate * 100);
+        Console.WriteLine($"  VAT {pct}%: portion {portionIncl} incl  =  {portionExcl} excl  +  {vatAmount} vat  (based on {g.AbsTotal}/{totalAbsIncl} of product rows)");
+        feeRows.Add(new
+        {
+            systemId = Guid.NewGuid(),
+            orderRowType = "fee",
+            description = "Refund fee",
+            quantity = 1,
+            unitPriceIncludingVat = portionIncl,
+            unitPriceExcludingVat = portionExcl,
+            totalIncludingVat = portionIncl,
+            totalExcludingVat = portionExcl,
+            totalVat = vatAmount,
+            vatRate = g.VatRate,
+            vatDetails = new[] { new { vatRate = g.VatRate, amountIncludingVat = portionIncl, vat = vatAmount } }
+        });
+    }
+
+    // Lookup SRO system ID (UUID) from string ID
+    var lookupBody = await Send(HttpMethod.Post,
+        $"{host}/Litium/api/admin/sales/salesReturnOrders/keyLookups",
+        JsonContent.Create(new[] { sroId }));
+    var sroSystemId = JsonNode.Parse(lookupBody)?[sroId]?.GetValue<string>();
+    if (string.IsNullOrEmpty(sroSystemId))
+        throw new InvalidOperationException($"Could not resolve systemId for SRO {sroId}");
+
+    var patchOps = feeRows.Select(r => new { op = "add", path = "/rows/-", value = r }).ToArray();
+    var patchContent = new StringContent(JsonSerializer.Serialize(patchOps), Encoding.UTF8, "application/json-patch+json");
+    var patchBody = await Send(HttpMethod.Patch,
+        $"{host}/Litium/api/admin/sales/salesReturnOrders/{sroSystemId}",
+        patchContent);
+    var patchJson = JsonNode.Parse(patchBody);
+    Console.WriteLine($"SRO: {patchJson?["id"]}  |  grandTotal: {patchJson?["grandTotal"]} {patchJson?["currencyCode"]}");
+    Console.WriteLine("Rows:");
+    foreach (var row in patchJson?["rows"]?.AsArray() ?? [])
+        Console.WriteLine($"  [{row?["orderRowType"]}] {row?["description"]}  total: {row?["totalIncludingVat"]}  vat: {row?["totalVat"]}");
 }
 
 async Task RegisterReceivedQuantities()
