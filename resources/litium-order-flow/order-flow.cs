@@ -134,12 +134,22 @@ while (running)
 // Helper functions
 // ============================================================
 
-async Task<string> ReadAndValidate(HttpResponseMessage response)
+async Task<string> Send(HttpMethod method, string url, HttpContent? content = null)
 {
+    Console.WriteLine($"{method} {url}");
+    using var request = new HttpRequestMessage(method, url) { Content = content };
+    var response = await client.SendAsync(request);
     var body = await response.Content.ReadAsStringAsync();
     if (!response.IsSuccessStatusCode)
         throw new HttpRequestException($"HTTP {(int)response.StatusCode} {response.ReasonPhrase}: {body}");
     return body;
+}
+
+void ConsoleWrite(IEnumerable<string> lines, string prompt = "> ")
+{
+    foreach (var line in lines)
+        Console.WriteLine(line);
+    Console.Write(prompt);
 }
 
 async Task Login()
@@ -149,8 +159,7 @@ async Task Login()
         Encoding.UTF8,
         "application/x-www-form-urlencoded");
 
-    var response = await client.PostAsync($"{host}/Litium/Oauth/Token", form);
-    var body = await ReadAndValidate(response);
+    var body = await Send(HttpMethod.Post, $"{host}/Litium/Oauth/Token", form);
 
     var json = JsonNode.Parse(body) ?? throw new InvalidOperationException("Empty login response.");
     token = json["access_token"]?.GetValue<string>() ?? throw new InvalidOperationException("Missing access_token.");
@@ -161,8 +170,7 @@ async Task Login()
 
 async Task GetOrder()
 {
-    var response = await client.GetAsync($"{host}/Litium/api/connect/erp/orders/{orderId}");
-    var body = await ReadAndValidate(response);
+    var body = await Send(HttpMethod.Get, $"{host}/Litium/api/connect/erp/orders/{orderId}");
     order = JsonNode.Parse(body) ?? throw new InvalidOperationException("Empty order response.");
 }
 
@@ -197,10 +205,8 @@ void PrintOrder()
 
 async Task<string> NotifyExported()
 {
-    var response = await client.PostAsync(
-        $"{host}/Litium/api/connect/erp/orders/{orderId}/notify/exported",
+    return await Send(HttpMethod.Post, $"{host}/Litium/api/connect/erp/orders/{orderId}/notify/exported",
         new StringContent("", Encoding.UTF8, "application/json"));
-    return await ReadAndValidate(response);
 }
 
 async Task<string> CreateShipmentFromAllItems()
@@ -220,10 +226,8 @@ async Task<string> CreateShipmentFromAllItems()
             }).ToArray()
     };
 
-    var response = await client.PostAsync(
-        $"{host}/Litium/api/connect/erp/orders/{orderId}/shipments",
+    return await Send(HttpMethod.Post, $"{host}/Litium/api/connect/erp/orders/{orderId}/shipments",
         JsonContent.Create(shipment));
-    return await ReadAndValidate(response);
 }
 
 async Task<string> CreateShipmentFromOneItem()
@@ -244,19 +248,16 @@ async Task<string> CreateShipmentFromOneItem()
             }).ToArray()
     };
 
-    var response = await client.PostAsync(
-        $"{host}/Litium/api/connect/erp/orders/{orderId}/shipments",
+    return await Send(HttpMethod.Post, $"{host}/Litium/api/connect/erp/orders/{orderId}/shipments",
         JsonContent.Create(shipment));
-    return await ReadAndValidate(response);
 }
 
 async Task Ship(string shipmentId)
 {
     Console.WriteLine($"Shipping: {shipmentId}");
-    var response = await client.PostAsync(
+    var body = await Send(HttpMethod.Post,
         $"{host}/Litium/api/connect/erp/orders/{orderId}/shipments/{shipmentId}/notify/delivered",
         new StringContent("", Encoding.UTF8, "application/json"));
-    var body = await ReadAndValidate(response);
     var responseJson = JsonNode.Parse(body);
     var shipment = responseJson?["shipments"]?.AsArray().FirstOrDefault(s => s?["id"]?.GetValue<string>() == shipmentId);
     if (shipment is not null)
@@ -329,12 +330,10 @@ async Task CreateRMA(bool interactive)
     }
 
     var rma = new { SystemId = Guid.NewGuid(), SalesOrderId = orderId, FirstName = "Test", LastName = "User", Phone = "0700000000", Email = "testuser@example.com", Comments = "Test return", PackageCondition = "Opened", CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow, Rows = rmaRows };
-    var rmaResponse = await client.PostAsync($"{host}/Litium/api/connect/erp/rmas", JsonContent.Create(rma));
-    var rmaBody = await ReadAndValidate(rmaResponse);
+    var rmaBody = await Send(HttpMethod.Post, $"{host}/Litium/api/connect/erp/rmas", JsonContent.Create(rma));
     rmaSystemId = JsonNode.Parse(rmaBody)!["id"]!.GetValue<string>();
     var patch = new[] { new { path = "id", op = "replace", value = $"{orderId}_R1" } };
-    var patchResponse = await client.PatchAsync($"{host}/Litium/api/admin/sales/returnAuthorizations/{rmaSystemId}", JsonContent.Create(patch));
-    var patchBody = await ReadAndValidate(patchResponse);
+    var patchBody = await Send(HttpMethod.Patch, $"{host}/Litium/api/admin/sales/returnAuthorizations/{rmaSystemId}", JsonContent.Create(patch));
     var patchJson = JsonNode.Parse(patchBody);
     Console.WriteLine($"RMA created: {patchJson?["id"]}");
     Console.WriteLine("Rows:");
@@ -351,16 +350,13 @@ async Task RMAMenu()
         Console.WriteLine("=== RMA Menu ===");
         if (rmaList.Count == 0)
         {
-            Console.WriteLine("  No RMAs found for this order.");
-            Console.Write("  Press Enter to go back...");
+            ConsoleWrite(["  No RMAs found for this order."], "  Press Enter to go back...");
             Console.ReadLine();
             return;
         }
-        Console.WriteLine("  Available RMAs:");
-        for (int i = 0; i < rmaList.Count; i++)
-            Console.WriteLine($"  {i + 1}.  {rmaList[i]["id"]}  state: {rmaList[i]["state"]}");
-        Console.WriteLine("  0.  Back");
-        Console.Write("> ");
+        var rmaLines = rmaList.Select((r, i) => $"  {i + 1}.  {r["id"]}  state: {r["state"]}")
+            .Prepend("  Available RMAs:").Append("  0.  Back");
+        ConsoleWrite(rmaLines);
         var sel = Console.ReadLine()?.Trim();
         if (sel == "0") return;
         if (!int.TryParse(sel, out var idx) || idx < 1 || idx > rmaList.Count)
@@ -379,19 +375,20 @@ async Task RMAActionMenu()
     {
         await GetState();
         var rmaNode = rmaList.FirstOrDefault(r => r["id"]?.GetValue<string>() == rmaSystemId);
-        Console.WriteLine();
-        Console.WriteLine("=== RMA Actions ===");
-        Console.WriteLine($"  RMA:   {rmaSystemId}");
-        Console.WriteLine($"  State: {rmaNode?["state"]}");
-        Console.WriteLine();
-        Console.WriteLine("  p.  Print full RMA JSON");
-        Console.WriteLine("  1.  Notify package received      – RMA: package arrived at warehouse (→ PackageReceived)");
-        Console.WriteLine("  2.  Register received quantities  – RMA: set physically received qty (required before approve)");
-        Console.WriteLine("  3.  Notify processing             – RMA: notify that returned goods are being processed (→ Processing)");
-        Console.WriteLine("  4.  Approve                       – RMA: approve return → Litium auto-creates SRO (→ Approved)");
-        Console.WriteLine("  5.  Notify completed              – RMA: notify that physical processing is complete (→ Completed)");
-        Console.WriteLine("  0.  Back");
-        Console.Write("> ");
+        ConsoleWrite([
+            "",
+            "=== RMA Actions ===",
+            $"  RMA:   {rmaSystemId}",
+            $"  State: {rmaNode?["state"]}",
+            "",
+            "  p.  Print full RMA JSON",
+            "  1.  Notify package received       – RMA: package arrived at warehouse (→ PackageReceived)",
+            "  2.  Register received quantities  – RMA: set physically received qty (required before approve)",
+            "  3.  Notify processing             – RMA: notify that returned goods are being processed (→ Processing)",
+            "  4.  Approve                       – RMA: approve return → Litium auto-creates SRO (→ Approved)",
+            "  5.  Notify completed              – RMA: notify that physical processing is complete (→ Completed)",
+            "  0.  Back"
+        ]);
         try
         {
             switch (Console.ReadLine()?.Trim())
@@ -422,30 +419,37 @@ async Task SROMenu()
         await GetState();
         Console.WriteLine();
         Console.WriteLine("=== SRO Menu ===");
+        string? selectedId;
         if (sroList.Count == 0)
         {
-            Console.WriteLine("  No SROs found automatically.");
-            Console.Write("  Enter SRO ID manually (or Enter to go back): ");
+            ConsoleWrite(["  No SROs found automatically."], "  Enter SRO ID manually (or Enter to go back): ");
             var manual = Console.ReadLine()?.Trim();
             if (string.IsNullOrEmpty(manual)) return;
-            sroId = manual;
-            await SROActionMenu();
-            continue;
+            selectedId = manual;
         }
-        Console.WriteLine("  Available SROs:");
-        for (int i = 0; i < sroList.Count; i++)
-            Console.WriteLine($"  {i + 1}.  {sroList[i]}");
-        Console.WriteLine("  0.  Back");
-        Console.Write("> ");
-        var sel = Console.ReadLine()?.Trim();
-        if (sel == "0") return;
-        if (!int.TryParse(sel, out var idx) || idx < 1 || idx > sroList.Count)
+        else
         {
-            Console.WriteLine("Invalid choice.");
-            continue;
+            var sroLines = sroList.Select((s, i) => $"  {i + 1}.  {s}")
+                .Prepend("  Available SROs:").Append("  0.  Back");
+            ConsoleWrite(sroLines);
+            var sel = Console.ReadLine()?.Trim();
+            if (sel == "0") return;
+            if (!int.TryParse(sel, out var idx) || idx < 1 || idx > sroList.Count)
+            {
+                Console.WriteLine("Invalid choice.");
+                continue;
+            }
+            selectedId = sroList[idx - 1];
         }
-        sroId = sroList[idx - 1];
-        await SROActionMenu();
+        try
+        {
+            sroId = selectedId;
+            await SROActionMenu();
+        }
+        catch (HttpRequestException ex)
+        {
+            Console.WriteLine($"[HTTP ERROR] {ex.Message}");
+        }
     }
 }
 
@@ -453,14 +457,17 @@ async Task SROActionMenu()
 {
     while (true)
     {
-        Console.WriteLine();
-        Console.WriteLine("=== SRO Actions ===");
-        Console.WriteLine($"  SRO: {sroId}");
-        Console.WriteLine();
-        Console.WriteLine("  1.  Confirm return");
-        Console.WriteLine("  2.  Refund");
-        Console.WriteLine("  0.  Back");
-        Console.Write("> ");
+        var sroBody = await Send(HttpMethod.Get, $"{host}/Litium/api/connect/erp/orders/{sroId}");
+        var sroOrder = JsonNode.Parse(sroBody);
+        ConsoleWrite([
+            "",
+            "=== SRO Actions ===",
+            $"  SRO: {sroOrder?["id"]}  |  {sroOrder?["grandTotal"]} {sroOrder?["currencyCode"]}",
+            "",
+            "  1.  Confirm return",
+            "  2.  Refund",
+            "  0.  Back"
+        ]);
         try
         {
             switch (Console.ReadLine()?.Trim())
@@ -479,8 +486,7 @@ async Task SROActionMenu()
 async Task RegisterReceivedQuantities()
 {
     // GET current state of the return authorization
-    var getResponse = await client.GetAsync($"{host}/Litium/api/admin/sales/returnAuthorizations/{rmaSystemId}");
-    var getBody = await ReadAndValidate(getResponse);
+    var getBody = await Send(HttpMethod.Get, $"{host}/Litium/api/admin/sales/returnAuthorizations/{rmaSystemId}");
     var ra = JsonNode.Parse(getBody)!;
 
     // Prompt for quantityReceived per row (default = quantityReturned)
@@ -494,10 +500,8 @@ async Task RegisterReceivedQuantities()
         row["quantityReceived"] = received;
     }
 
-    var putResponse = await client.PutAsJsonAsync(
-        $"{host}/Litium/api/admin/sales/returnAuthorizations/{rmaSystemId}",
-        ra);
-    var putBody = await ReadAndValidate(putResponse);
+    var putBody = await Send(HttpMethod.Put, $"{host}/Litium/api/admin/sales/returnAuthorizations/{rmaSystemId}",
+        JsonContent.Create(ra));
     var putJson = JsonNode.Parse(putBody);
     Console.WriteLine("Received quantities registered:");
     foreach (var row in putJson?["rows"]?.AsArray() ?? [])
@@ -507,15 +511,13 @@ async Task RegisterReceivedQuantities()
 async Task RmaNotify(string action)
 {
     var url = $"{host}/Litium/api/connect/erp/rmas/{rmaSystemId}/notify/{action}";
-    var response = await client.PostAsync(url, new StringContent("", Encoding.UTF8, "application/json"));
-    PrintRmaResponse(await ReadAndValidate(response));
+    PrintRmaResponse(await Send(HttpMethod.Post, url, new StringContent("", Encoding.UTF8, "application/json")));
 }
 
 async Task RmaAction(string action)
 {
     var url = $"{host}/Litium/api/connect/erp/rmas/{rmaSystemId}/action/{action}";
-    var response = await client.PostAsync(url, new StringContent("", Encoding.UTF8, "application/json"));
-    var body = await ReadAndValidate(response);
+    var body = await Send(HttpMethod.Post, url, new StringContent("", Encoding.UTF8, "application/json"));
     var json = JsonNode.Parse(body);
     // Capture the SRO ID returned by approve
     var returnSlipId = json?["returnSlipId"]?.GetValue<string>();
@@ -546,8 +548,7 @@ async Task SroAction(string action)
     }
     Console.WriteLine($"SRO action '{action}' on {sroId}");
     var url = $"{host}/Litium/api/connect/erp/salesReturnOrders/{sroId}/action/{action}";
-    var response = await client.PostAsync(url, new StringContent("", Encoding.UTF8, "application/json"));
-    var body = await ReadAndValidate(response);
+    var body = await Send(HttpMethod.Post, url, new StringContent("", Encoding.UTF8, "application/json"));
     var json = JsonNode.Parse(body);
     Console.WriteLine($"SRO: {json?["id"]}  |  {json?["grandTotal"]} {json?["currencyCode"]}");
     Console.WriteLine("Rows:");
