@@ -6,7 +6,7 @@ using Litium.Products;
 using Litium.Products.StockStatusCalculator;
 using Litium.Runtime.DependencyInjection;
 
-namespace Litium.Accelerator.Bft.Decorators;
+namespace Litium.Accelerator.Decorators;
 
 /// <summary>
 /// Calculate quantity in stock for a bundle based on the stock of its bundled items.

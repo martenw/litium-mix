@@ -8,7 +8,7 @@ if (obj.status == 200 && req.http.X-ApplePay-Verify) {
   }
   
   if (req.http.X-ApplePay-Verify == "site2") {
-    include "bft_apple_verify_site2.vcl";
+    include "apple_verify_site2.vcl";
     return (deliver);
   }
 
