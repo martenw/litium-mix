@@ -64,11 +64,12 @@ while (running)
     Console.WriteLine("  1.  Notify exported");
     Console.WriteLine("  2.  Create shipment – all rows");
     Console.WriteLine("  3.  Create shipment – one row");
-    Console.WriteLine("  4.  Mark delivered (Ship)");
+    Console.WriteLine("  4.  Mark delivered (Ship) - Wait for payment capture success");
     Console.WriteLine("  5.  Create RMA – all rows");
     Console.WriteLine("  6.  Create RMA – interactive");
     Console.WriteLine("  r.  RMA menu");
     Console.WriteLine("  s.  SRO menu");
+    Console.WriteLine("  o.  [Admin API] Try set order state...");
     Console.WriteLine("  0.  Exit");
     Console.Write("> ");
 
@@ -111,6 +112,10 @@ while (running)
             case "s":
             case "S":
                 await SROMenu();
+                break;
+            case "o":
+            case "O":
+                await OrderStateMenu();
                 break;
             case "0":
                 running = false;
@@ -195,12 +200,83 @@ async Task GetState()
         var s = r["returnSlipId"]?.GetValue<string>();
         if (!string.IsNullOrEmpty(s) && !sroList.Contains(s)) sroList.Add(s);
     }
+
+    // Pick up shipmentId from existing shipments if not already set in this session
+    if (string.IsNullOrEmpty(shipmentId))
+    {
+        var firstShipment = order["shipments"]?.AsArray().FirstOrDefault();
+        if (firstShipment is not null)
+            shipmentId = firstShipment["id"]?.GetValue<string>() ?? "";
+    }
 }
 
 void PrintOrder()
 {
     if (order is null) { Console.WriteLine("[ERROR] No order loaded."); return; }
     Console.WriteLine(order.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+}
+
+async Task OrderStateMenu()
+{
+    while (true)
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== Order State Menu ===");
+        var states = new[] { 
+            "Init", 
+            "Confirmed", 
+            "PendingProcessing", 
+            "Processing", 
+            "Completed", 
+            "Cancelled" 
+        };
+        for (int i = 0; i < states.Length; i++)
+        {
+            Console.WriteLine($"  {i + 1}.  {states[i]}");
+        }
+        Console.WriteLine("  0.  Back");
+        Console.Write("> ");
+        
+        var sel = Console.ReadLine()?.Trim();
+        if (sel == "0") return;
+        
+        if (int.TryParse(sel, out var idx) && idx >= 1 && idx <= states.Length)
+        {
+            await SetSalesOrderState(states[idx - 1]);
+            return;
+        }
+        Console.WriteLine("Invalid choice.");
+    }
+}
+
+async Task SetSalesOrderState(string targetState)
+{
+    // Lookup Order system ID (UUID) from string ID
+    var lookupBody = await Send(HttpMethod.Post,
+        $"{host}/Litium/api/admin/sales/salesOrders/keyLookups",
+        JsonContent.Create(new[] { orderId }));
+    
+    var orderSystemId = JsonNode.Parse(lookupBody)?[orderId]?.GetValue<string>();
+    if (string.IsNullOrEmpty(orderSystemId))
+    {
+        Console.WriteLine($"[ERROR] Could not resolve systemId for Order {orderId}");
+        return;
+    }
+
+    try
+    {
+        var url = $"{host}/Litium/api/admin/sales/salesOrders/{orderSystemId}/stateTransition/{targetState}";
+        var body = await Send(HttpMethod.Put, url, new StringContent("", Encoding.UTF8, "application/json"));
+        Console.WriteLine($"[Admin API] Successfully transitioned order {orderId} to {targetState}.");
+        
+        // Refresh the local state
+        await GetState();
+    }
+    catch (HttpRequestException ex)
+    {
+        Console.WriteLine($"[ERROR] Admin API state transition failed: {ex.Message}");
+        Console.WriteLine("If this endpoint fails with 404, verify the systemId or target state.");
+    }
 }
 
 async Task<string> NotifyExported()
@@ -383,7 +459,7 @@ async Task RMAActionMenu()
             "",
             "  p.  Print full RMA JSON",
             "  1.  Notify package received       – RMA: package arrived at warehouse (→ PackageReceived)",
-            "  2.  Register received quantities  – RMA: set physically received qty (required before approve)",
+            "  2.  [Admin API] Register received quantities  – RMA: set physically received qty (required before approve)",
             "  3.  Notify processing             – RMA: notify that returned goods are being processed (→ Processing)",
             "  4.  Approve                       – RMA: approve return → Litium auto-creates SRO (→ Approved)",
             "  5.  Notify completed              – RMA: notify that physical processing is complete (→ Completed)",
@@ -471,8 +547,8 @@ async Task SROActionMenu()
             "",
             "  p.  Print SRO JSON",
             "  1.  Confirm return",
-            "  2.  Refund",
-            "  3.  Add refund fee",
+            "  2.  [Admin API] Add refund fee",
+            "  3.  Refund",
             "  0.  Back"
         ]);
         try
@@ -484,8 +560,8 @@ async Task SROActionMenu()
                     Console.WriteLine(sroOrder?.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
                     break;
                 case "1": await SroAction("confirmReturn"); break;
-                case "2": await SroAction("refund"); break;
-                case "3": await AddRefundFee(sroOrder!); break;
+                case "2": await AddRefundFee(sroOrder!); break;
+                case "3": await SroAction("refund"); break;
                 case "0": return;
                 default: Console.WriteLine("Invalid choice."); break;
             }
