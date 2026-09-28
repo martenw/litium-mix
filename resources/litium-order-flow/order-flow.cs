@@ -70,6 +70,7 @@ while (running)
     Console.WriteLine("  r.  RMA menu");
     Console.WriteLine("  s.  SRO menu");
     Console.WriteLine("  o.  [Admin API] Try set order state...");
+    Console.WriteLine("  h.  [Admin API] Try set shipment state...");
     Console.WriteLine("  0.  Exit");
     Console.Write("> ");
 
@@ -116,6 +117,10 @@ while (running)
             case "o":
             case "O":
                 await OrderStateMenu();
+                break;
+            case "h":
+            case "H":
+                await ShipmentStateMenu();
                 break;
             case "0":
                 running = false;
@@ -276,6 +281,73 @@ async Task SetSalesOrderState(string targetState)
     {
         Console.WriteLine($"[ERROR] Admin API state transition failed: {ex.Message}");
         Console.WriteLine("If this endpoint fails with 404, verify the systemId or target state.");
+    }
+}
+
+async Task ShipmentStateMenu()
+{
+    if (string.IsNullOrEmpty(shipmentId))
+    {
+        Console.WriteLine("[ERROR] No shipment found. Create a shipment first (option 2 or 3).");
+        return;
+    }
+
+    while (true)
+    {
+        Console.WriteLine();
+        Console.WriteLine($"=== Shipment State Menu ({shipmentId}) ===");
+        var states = new[] {
+            "Init",
+            "Processing",
+            "Cancelled",
+            "Returned",
+            "ReadyToShip",
+            "Shipped"
+        };
+        for (int i = 0; i < states.Length; i++)
+        {
+            Console.WriteLine($"  {i + 1}.  {states[i]}");
+        }
+        Console.WriteLine("  0.  Back");
+        Console.Write("> ");
+
+        var sel = Console.ReadLine()?.Trim();
+        if (sel == "0") return;
+
+        if (int.TryParse(sel, out var idx) && idx >= 1 && idx <= states.Length)
+        {
+            await SetShipmentState(states[idx - 1]);
+            return;
+        }
+        Console.WriteLine("Invalid choice.");
+    }
+}
+
+async Task SetShipmentState(string targetState)
+{
+    var lookupBody = await Send(HttpMethod.Post,
+        $"{host}/Litium/api/admin/sales/shipments/keyLookups",
+        JsonContent.Create(new[] { shipmentId }));
+
+    var shipmentSystemId = JsonNode.Parse(lookupBody)?[shipmentId]?.GetValue<string>();
+    if (string.IsNullOrEmpty(shipmentSystemId))
+    {
+        Console.WriteLine($"[ERROR] Could not resolve systemId for shipment {shipmentId}");
+        return;
+    }
+
+    try
+    {
+        var url = $"{host}/Litium/api/admin/sales/shipments/{shipmentSystemId}/stateTransition/{targetState}";
+        await Send(HttpMethod.Put, url, new StringContent("", Encoding.UTF8, "application/json"));
+        Console.WriteLine($"[Admin API] Successfully transitioned shipment {shipmentId} to {targetState}.");
+
+        await GetState();
+    }
+    catch (HttpRequestException ex)
+    {
+        Console.WriteLine($"[ERROR] Admin API state transition failed: {ex.Message}");
+        Console.WriteLine("Verify that the selected transition is valid from the shipment's current state.");
     }
 }
 
